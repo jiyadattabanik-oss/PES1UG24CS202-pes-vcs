@@ -92,12 +92,57 @@ int object_exists(const ObjectID *id) {
 //
 
 //
-// Returns 0 on success, -1 on error.
+// object.c — Content-addressable object store
+#include "pes.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <openssl/evp.h>
+
+void hash_to_hex(const ObjectID *id, char *hex_out) {
+    for (int i = 0; i < HASH_SIZE; i++)
+        sprintf(hex_out + i * 2, "%02x", id->hash[i]);
+    hex_out[HASH_HEX_SIZE] = '\0';
+}
+
+int hex_to_hash(const char *hex, ObjectID *id_out) {
+    if (strlen(hex) < HASH_HEX_SIZE) return -1;
+    for (int i = 0; i < HASH_SIZE; i++) {
+        unsigned int byte;
+        if (sscanf(hex + i * 2, "%2x", &byte) != 1) return -1;
+        id_out->hash[i] = (uint8_t)byte;
+    }
+    return 0;
+}
+
+void compute_hash(const void *data, size_t len, ObjectID *id_out) {
+    unsigned int hash_len;
+    EVP_MD_CTX *ctx = EVP_MD_CTX_new();
+    EVP_DigestInit_ex(ctx, EVP_sha256(), NULL);
+    EVP_DigestUpdate(ctx, data, len);
+    EVP_DigestFinal_ex(ctx, id_out->hash, &hash_len);
+    EVP_MD_CTX_free(ctx);
+}
+
+void object_path(const ObjectID *id, char *path_out, size_t path_size) {
+    char hex[HASH_HEX_SIZE + 1];
+    hash_to_hex(id, hex);
+    snprintf(path_out, path_size, "%s/%.2s/%s", OBJECTS_DIR, hex, hex + 2);
+}
+
+int object_exists(const ObjectID *id) {
+    char path[512];
+    object_path(id, path, sizeof(path));
+    return access(path, F_OK) == 0;
+}
+
 int object_write(ObjectType type, const void *data, size_t len, ObjectID *id_out) {
     const char *type_str = (type == OBJ_BLOB) ? "blob" :
                            (type == OBJ_TREE) ? "tree" : "commit";
 
-    // 1. Build header + full object
     char header[64];
     int header_len = snprintf(header, sizeof(header), "%s %zu", type_str, len) + 1;
 
@@ -107,25 +152,19 @@ int object_write(ObjectType type, const void *data, size_t len, ObjectID *id_out
     memcpy(full, header, header_len);
     memcpy(full + header_len, data, len);
 
-    // 2. Compute hash of full object
     compute_hash(full, full_len, id_out);
 
-    // 3. Deduplication
     if (object_exists(id_out)) {
         free(full);
         return 0;
     }
 
-    // 4. Create .pes/objects/ and shard directory (both may not exist yet)
-    mkdir(OBJECTS_DIR, 0755);   // create .pes/objects/ — ignore error if exists
-
     char hex[HASH_HEX_SIZE + 1];
     hash_to_hex(id_out, hex);
     char shard_dir[512];
     snprintf(shard_dir, sizeof(shard_dir), "%s/%.2s", OBJECTS_DIR, hex);
-    mkdir(shard_dir, 0755);     // create .pes/objects/XX/ — ignore error if exists
+    mkdir(shard_dir, 0755);
 
-    // 5. Write to temp file
     char final_path[512];
     object_path(id_out, final_path, sizeof(final_path));
     char tmp_path[520];
@@ -138,30 +177,21 @@ int object_write(ObjectType type, const void *data, size_t len, ObjectID *id_out
         close(fd); free(full); return -1;
     }
     free(full);
-
-    // 6. fsync temp file
-    if (fsync(fd) != 0) { close(fd); return -1; }
+    fsync(fd);
     close(fd);
 
-    // 7. Atomic rename
     if (rename(tmp_path, final_path) != 0) return -1;
 
-    // 8. fsync shard directory
     int dir_fd = open(shard_dir, O_RDONLY);
-    if (dir_fd >= 0) {
-        fsync(dir_fd);
-        close(dir_fd);
-    }
+    if (dir_fd >= 0) { fsync(dir_fd); close(dir_fd); }
 
     return 0;
 }
 
 int object_read(const ObjectID *id, ObjectType *type_out, void **data_out, size_t *len_out) {
-    // 1. Get file path
     char path[512];
     object_path(id, path, sizeof(path));
 
-    // 2. Open and read entire file
     FILE *f = fopen(path, "rb");
     if (!f) return -1;
 
@@ -177,14 +207,12 @@ int object_read(const ObjectID *id, ObjectType *type_out, void **data_out, size_
     }
     fclose(f);
 
-    // 4. Verify integrity first
     ObjectID computed;
     compute_hash(buf, (size_t)file_size, &computed);
     if (memcmp(computed.hash, id->hash, HASH_SIZE) != 0) {
         free(buf); return -1;
     }
 
-    // 3. Parse header — find '\0' separator
     uint8_t *nul = memchr(buf, '\0', (size_t)file_size);
     if (!nul) { free(buf); return -1; }
 
@@ -198,7 +226,6 @@ int object_read(const ObjectID *id, ObjectType *type_out, void **data_out, size_
     if (!space) { free(buf); return -1; }
     size_t data_len = (size_t)atol(space + 1);
 
-    // 6. Copy data portion
     uint8_t *data_start = nul + 1;
     size_t actual = (size_t)file_size - (size_t)(data_start - buf);
     if (actual != data_len) { free(buf); return -1; }
