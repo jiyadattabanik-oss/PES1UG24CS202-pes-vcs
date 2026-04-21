@@ -69,7 +69,6 @@ int object_exists(const ObjectID *id) {
 //
 // Returns 0 on success, -1 on error.
 int object_write(ObjectType type, const void *data, size_t len, ObjectID *id_out) {
-    // 1. Build the header string: "blob 42\0", "tree 42\0", or "commit 42\0"
     const char *type_str;
     switch (type) {
         case OBJ_BLOB:   type_str = "blob";   break;
@@ -78,54 +77,58 @@ int object_write(ObjectType type, const void *data, size_t len, ObjectID *id_out
         default: return -1;
     }
 
+    // Build header
     char header[64];
     int header_len = snprintf(header, sizeof(header), "%s %zu", type_str, len);
-    // header_len does NOT include the null terminator, but we want it in the object
-    size_t full_len = (size_t)header_len + 1 + len; // header + '\0' + data
 
-    // 2. Build the full object in memory (header + '\0' + data)
+    size_t full_len = header_len + 1 + len; // +1 for '\0'
     uint8_t *full = malloc(full_len);
     if (!full) return -1;
+
     memcpy(full, header, header_len);
     full[header_len] = '\0';
     memcpy(full + header_len + 1, data, len);
 
-    // 3. Compute SHA-256 of the full object
+    // Compute hash
     ObjectID id;
     compute_hash(full, full_len, &id);
 
-    // 4. Deduplication — if it already exists, we're done
+    // Deduplication
     if (object_exists(&id)) {
         *id_out = id;
         free(full);
         return 0;
     }
 
-    // 5. Create the shard directory (.pes/objects/XX/)
+    // 🔥 FIX: Ensure directories exist
+    mkdir(".pes", 0755);
+    mkdir(".pes/objects", 0755);
+
+    // Create shard directory
     char hex[HASH_HEX_SIZE + 1];
     hash_to_hex(&id, hex);
 
     char shard_dir[256];
     snprintf(shard_dir, sizeof(shard_dir), "%s/%.2s", OBJECTS_DIR, hex);
-    mkdir(shard_dir, 0755); // OK if it already exists
+    mkdir(shard_dir, 0755);
 
-    // 6. Write to a temp file in the same shard directory
+    // Paths
     char final_path[512];
     object_path(&id, final_path, sizeof(final_path));
 
     char tmp_path[520];
     snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", final_path);
 
+    // Write file
     int fd = open(tmp_path, O_CREAT | O_WRONLY | O_TRUNC, 0644);
     if (fd < 0) {
         free(full);
         return -1;
     }
 
-    // Write all bytes
     size_t written = 0;
     while (written < full_len) {
-        ssize_t n = write(fd, (uint8_t *)full + written, full_len - written);
+        ssize_t n = write(fd, full + written, full_len - written);
         if (n <= 0) {
             close(fd);
             unlink(tmp_path);
@@ -135,101 +138,92 @@ int object_write(ObjectType type, const void *data, size_t len, ObjectID *id_out
         written += n;
     }
 
-    // 7. fsync the temp file to ensure data is on disk
     fsync(fd);
     close(fd);
     free(full);
 
-    // 8. Atomically rename temp → final
+    // Atomic rename
     if (rename(tmp_path, final_path) != 0) {
         unlink(tmp_path);
         return -1;
     }
 
-    // 9. fsync the shard directory to persist the rename
+    // fsync directory
     int dir_fd = open(shard_dir, O_RDONLY);
     if (dir_fd >= 0) {
         fsync(dir_fd);
         close(dir_fd);
     }
 
-    // 10. Return the computed hash
     *id_out = id;
     return 0;
 }
-
 // Read an object from the store.
 //
 // Returns 0 on success, -1 on error.
 int object_read(const ObjectID *id, ObjectType *type_out, void **data_out, size_t *len_out) {
-    // 1. Get the file path
     char path[512];
     object_path(id, path, sizeof(path));
 
-    // 2. Open and read the entire file
     FILE *f = fopen(path, "rb");
     if (!f) return -1;
 
     fseek(f, 0, SEEK_END);
     long file_size = ftell(f);
-    fseek(f, 0, SEEK_SET);
+    rewind(f);
 
     if (file_size <= 0) {
         fclose(f);
         return -1;
     }
 
-    uint8_t *raw = malloc((size_t)file_size);
+    uint8_t *raw = malloc(file_size);
     if (!raw) {
         fclose(f);
         return -1;
     }
 
-    if (fread(raw, 1, (size_t)file_size, f) != (size_t)file_size) {
+    if (fread(raw, 1, file_size, f) != (size_t)file_size) {
         fclose(f);
         free(raw);
         return -1;
     }
     fclose(f);
 
-    // 3. Integrity check: recompute hash and compare to expected
-    ObjectID computed;
-    compute_hash(raw, (size_t)file_size, &computed);
-    if (memcmp(computed.hash, id->hash, HASH_SIZE) != 0) {
-        free(raw);
-        return -1; // Corruption detected
-    }
-
-    // 4. Parse the header: find the '\0' separating header from data
-    uint8_t *null_byte = memchr(raw, '\0', (size_t)file_size);
-    if (!null_byte) {
+    // Verify hash
+    ObjectID check;
+    compute_hash(raw, file_size, &check);
+    if (memcmp(check.hash, id->hash, HASH_SIZE) != 0) {
         free(raw);
         return -1;
     }
 
-    // 5. Parse type from header ("blob N", "tree N", "commit N")
-    if (strncmp((char *)raw, "blob ", 5) == 0) {
-        *type_out = OBJ_BLOB;
-    } else if (strncmp((char *)raw, "tree ", 5) == 0) {
-        *type_out = OBJ_TREE;
-    } else if (strncmp((char *)raw, "commit ", 7) == 0) {
-        *type_out = OBJ_COMMIT;
-    } else {
+    // Find header separator
+    uint8_t *null_pos = memchr(raw, '\0', file_size);
+    if (!null_pos) {
         free(raw);
         return -1;
     }
 
-    // 6. Extract data portion (everything after the '\0')
-    uint8_t *data_start = null_byte + 1;
-    size_t data_len = (size_t)file_size - (size_t)(data_start - raw);
+    // Parse type
+    if (strncmp((char *)raw, "blob ", 5) == 0) *type_out = OBJ_BLOB;
+    else if (strncmp((char *)raw, "tree ", 5) == 0) *type_out = OBJ_TREE;
+    else if (strncmp((char *)raw, "commit ", 7) == 0) *type_out = OBJ_COMMIT;
+    else {
+        free(raw);
+        return -1;
+    }
 
-    void *out = malloc(data_len + 1); // +1 for safety null terminator
+    uint8_t *data_start = null_pos + 1;
+    size_t data_len = file_size - (data_start - raw);
+
+    void *out = malloc(data_len);
     if (!out) {
         free(raw);
         return -1;
     }
+
     memcpy(out, data_start, data_len);
-    ((uint8_t *)out)[data_len] = '\0';
 
     *data_out = out;
     *len_out = data_len;
