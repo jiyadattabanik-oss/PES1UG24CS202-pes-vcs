@@ -54,12 +54,11 @@ void object_path(const ObjectID *id, char *path_out, size_t path_size) {
     snprintf(path_out, path_size, "%s/%.2s/%s", OBJECTS_DIR, hex, hex + 2);
 }
 
-int object_exists(const ObjectID *id) {
-    char path[512];
-    object_path(id, path, sizeof(path));
-    return access(path, F_OK) == 0;
+if (object_exists(&id)) {
+    *id_out = id;
+    free(full);
+    return 0;
 }
-
 // ─── TODO: Implement these ──────────────────────────────────────────────────
 
 // Write an object to the store.
@@ -120,11 +119,15 @@ int object_write(ObjectType type, const void *data, size_t len, ObjectID *id_out
         return 0;
     }
 
-    // 🔥 Ensure directories exist (robust)
-    struct stat st = {0};
-    if (stat(".pes", &st) == -1) mkdir(".pes", 0755);
-    if (stat(".pes/objects", &st) == -1) mkdir(".pes/objects", 0755);
+  struct stat st = {0};
 
+if (stat(".pes", &st) == -1) {
+    mkdir(".pes", 0755);
+}
+
+if (stat(OBJECTS_DIR, &st) == -1) {
+    mkdir(OBJECTS_DIR, 0755);
+}
     // Create shard dir
     char hex[HASH_HEX_SIZE + 1];
     hash_to_hex(id_out, hex);
